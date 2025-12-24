@@ -1,0 +1,985 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover" />
+  <title>Frost Flight</title>
+  <style>
+    :root{ --phone-w:450px; --phone-h:800px; --radius:34px; }
+    *{ box-sizing:border-box; -webkit-tap-highlight-color: transparent; }
+    html,body{ height:100%; }
+    body{
+      margin:0; overflow:hidden;
+      display:flex; align-items:center; justify-content:center;
+      background: linear-gradient(180deg, #0b1220, #04060c);
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+      touch-action:none;
+    }
+    #stage{ width:var(--phone-w); height:var(--phone-h); transform-origin:50% 50%;
+      filter: drop-shadow(0 30px 60px rgba(0,0,0,.55));
+    }
+    #phone{
+      width:100%; height:100%; border-radius:var(--radius);
+      position:relative; overflow:hidden; background:#05070c;
+      border:1px solid rgba(255,255,255,.10);
+    }
+    #phone::before{
+      content:""; position:absolute; inset:0; border-radius:var(--radius);
+      pointer-events:none;
+      background: linear-gradient(120deg, rgba(255,255,255,.10), transparent 35%, transparent 65%, rgba(255,255,255,.06));
+      mix-blend-mode: screen; opacity:.45;
+    }
+    canvas{ position:absolute; inset:0; width:100%; height:100%; display:block; touch-action:none; }
+    #loading{
+      position:absolute; inset:0; z-index:5;
+      display:flex; align-items:center; justify-content:center;
+      background: rgba(0,0,0,.55);
+      color:#fff; font-weight:800; letter-spacing:.06em; text-transform:uppercase;
+    }
+  </style>
+</head>
+<body>
+  <div id="stage">
+    <div id="phone">
+      <canvas id="game"></canvas>
+      <div id="loading">Loading assets…</div>
+    </div>
+  </div>
+
+<script>
+(() => {
+  "use strict";
+
+  /* ----------------------------- Utils ----------------------------- */
+  const clamp = (v,a,b)=>Math.max(a,Math.min(b,v));
+  const lerp  = (a,b,t)=>a+(b-a)*t;
+
+  function safeStorageGet(key, fallback) {
+    try { const v = localStorage.getItem(key); return (v==null)?fallback:v; } catch { return fallback; }
+  }
+  function safeStorageSet(key, value) {
+    try { localStorage.setItem(key, value); } catch {}
+  }
+
+  /* ----------------------------- Telegram WebApp ----------------------------- */
+  const REWARD_ACTION = "frost_flight_reward";
+  const REWARD_SCORE = 12; // награда после 12 очков
+
+  const tg = (() => {
+    try {
+      return window.Telegram?.WebApp || null;
+    } catch (_e) {
+      return null;
+    }
+  })();
+
+  if (tg) {
+    try {
+      tg.ready();
+      tg.expand?.();
+      tg.requestFullscreen?.();
+    } catch (err) {
+      console.warn("Telegram WebApp init failed", err);
+    }
+  }
+
+  function sendGiftReward(reason = "score") {
+    if (!tg?.sendData) return { sent:false, reason:"no-tg" };
+    try {
+      tg.sendData(REWARD_ACTION);
+      console.log(`[gift] sendData(${REWARD_ACTION}) ok (${reason})`);
+      tg.HapticFeedback?.notificationOccurred?.("success");
+      return { sent:true, reason:"ok" };
+    } catch (err) {
+      console.error(`Telegram sendData(${REWARD_ACTION}) failed`, err);
+      return { sent:false, reason:"error" };
+    }
+  }
+
+  /* ----------------------------- Canvas + scale ----------------------------- */
+  const stage = document.getElementById("stage");
+  const canvas = document.getElementById("game");
+  const ctx = canvas.getContext("2d", { alpha:true, desynchronized:true });
+  const loadingEl = document.getElementById("loading");
+
+  let DPR=1, W=0, H=0;
+
+  function updateStageScale() {
+    const pad = 18;
+    const sx = (window.innerWidth - pad) / 450;
+    const sy = (window.innerHeight - pad) / 800;
+    stage.style.transform = `scale(${Math.min(1,sx,sy)})`;
+  }
+  window.addEventListener("resize", updateStageScale, { passive:true });
+  updateStageScale();
+
+  function resizeCanvas() {
+    const rect = canvas.getBoundingClientRect();
+    DPR = Math.max(1, Math.min(3, window.devicePixelRatio || 1));
+    W = Math.max(1, Math.floor(rect.width));
+    H = Math.max(1, Math.floor(rect.height));
+    canvas.width  = Math.floor(W * DPR);
+    canvas.height = Math.floor(H * DPR);
+    ctx.setTransform(DPR,0,0,DPR,0,0);
+    ctx.imageSmoothingEnabled = true;
+  }
+  new ResizeObserver(resizeCanvas).observe(stage);
+  resizeCanvas();
+
+  const prevent = (e) => e.preventDefault();
+  document.addEventListener("touchmove", prevent, { passive:false });
+  document.addEventListener("gesturestart", prevent, { passive:false });
+
+  /* ----------------------------- Audio ----------------------------- */
+  class AudioSynth {
+    constructor(){ this.ctx=null; this.master=null; this.muted=false; this._unlocked=false; }
+    ensure(){
+      if (this._unlocked) return;
+      const AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return;
+      this.ctx = new AC();
+      this.master = this.ctx.createGain();
+      this.master.gain.value = 0.85;
+      this.master.connect(this.ctx.destination);
+      this._unlocked = true;
+      if (this.ctx.state==="suspended") this.ctx.resume().catch(()=>{});
+    }
+    setMuted(m){ this.muted=!!m; safeStorageSet("dmflappy.muted", this.muted?"1":"0"); }
+    _beep(f=440, t=0.06, type="sine"){
+      if (!this.ctx || this.muted) return;
+      const now=this.ctx.currentTime;
+      const o=this.ctx.createOscillator();
+      const g=this.ctx.createGain();
+      o.type=type; o.frequency.setValueAtTime(f,now);
+      g.gain.setValueAtTime(0.0001,now);
+      g.gain.exponentialRampToValueAtTime(0.22,now+0.01);
+      g.gain.exponentialRampToValueAtTime(0.0001,now+t);
+      o.connect(g); g.connect(this.master);
+      o.start(now); o.stop(now+t+0.02);
+    }
+    flap(){ this._beep(560,0.05,"triangle"); }
+    score(){ this._beep(900,0.07,"sine"); }
+    hit(){ this._beep(170,0.11,"sawtooth"); }
+  }
+  const audio = new AudioSynth();
+  audio.setMuted(safeStorageGet("dmflappy.muted","0")==="1");
+
+  /* ----------------------------- Assets ----------------------------- */
+  const ASSET_PATH = "assets/";
+
+  const FILES = {
+    bg: "фон",                       // jpg
+    groundOverlay: "нижняя подложка", // png
+
+    topObstacle: "столб вехний - сосулька",
+
+    pipeBack: "труба зад",
+    pipeFront:"труба перед",
+
+    gift: "подарок",
+
+    santaIdle: "дед мороз 2",
+    santaFlap1:"дед мороз 3",
+    santaFlap2:"дед мороз 4",
+
+    gameOverWindow: "икра окончена окно",
+    restart: "рестарт",
+    restartHover: "рестарт наведение"
+  };
+
+  const EXT = { bg:"jpg" }; // фон.jpg, остальное png
+
+  function loadImage(name, ext="png"){
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = () => reject(new Error("Не загрузилась картинка: " + name + "." + ext));
+      img.src = encodeURI(ASSET_PATH + name + "." + ext);
+    });
+  }
+
+  async function loadAllAssets(){
+    const out = {};
+    const keys = Object.keys(FILES);
+    await Promise.all(keys.map(async (k) => {
+      const ext = EXT[k] || "png";
+      try { out[k] = await loadImage(FILES[k], ext); }
+      catch (e) { console.warn(e.message); out[k] = null; }
+    }));
+    return out;
+  }
+
+  /* ----------------------------- Drawing helpers ----------------------------- */
+  function drawCover(img, x,y,w,h){
+    if (!img) return;
+    const iw=img.width, ih=img.height;
+    const s=Math.max(w/iw, h/ih);
+    const dw=iw*s, dh=ih*s;
+    ctx.drawImage(img, x+(w-dw)/2, y+(h-dh)/2, dw, dh);
+  }
+
+  // нижняя подложка: +15% по бокам, +5% вниз
+  function drawBottomOverlayExtended(img, w, h){
+    if (!img) return { x:0,y:h,width:0,height:0,scale:1 };
+    const overscanSides = 0.15;
+    const overscanBottom = 0.05;
+
+    const dw = w * (1 + overscanSides*2);
+    const dx = -w * overscanSides;
+    const s  = dw / img.width;
+    const dh = img.height * s;
+
+    const dy = h - dh * (1 - overscanBottom);
+
+    ctx.drawImage(img, dx, dy, dw, dh);
+    return { x:dx, y:dy, width:dw, height:dh, scale:s };
+  }
+
+  function textStrokeFill(text, x, y, sizePx, align="center", alpha=1){
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.font = `900 ${sizePx}px ui-sans-serif, system-ui`;
+    ctx.textAlign = align;
+    ctx.textBaseline = "top";
+    ctx.lineJoin = "round";
+    ctx.lineWidth = Math.max(6, Math.round(sizePx*0.16));
+    ctx.strokeStyle = "rgba(0,0,0,.55)";
+    ctx.fillStyle = "rgba(255,255,255,.98)";
+    ctx.strokeText(text, x, y);
+    ctx.fillText(text, x, y);
+    ctx.restore();
+  }
+
+  function roundedCapsulePath(x,y,w,h){
+    const r = h/2;
+    ctx.beginPath();
+    ctx.moveTo(x+r, y);
+    ctx.arcTo(x+w, y, x+w, y+h, r);
+    ctx.arcTo(x+w, y+h, x, y+h, r);
+    ctx.arcTo(x, y+h, x, y, r);
+    ctx.arcTo(x, y, x+w, y, r);
+    ctx.closePath();
+  }
+
+  function drawSfxToggle(x, y, w, h, on){
+    // Прозрачный фон, рисуем только toggle
+    const trackFill = on ? "#ffffff" : "#000000";
+    const knobFill  = on ? "#000000" : "#ffffff";
+
+    // track
+    ctx.save();
+    ctx.globalAlpha = 0.92;
+
+    // shadow
+    ctx.fillStyle = "rgba(0,0,0,.35)";
+    roundedCapsulePath(x+2, y+3, w, h);
+    ctx.fill();
+
+    // track body
+    ctx.fillStyle = trackFill;
+    roundedCapsulePath(x, y, w, h);
+    ctx.fill();
+
+    // subtle inner sheen
+    ctx.globalAlpha = 0.18;
+    ctx.fillStyle = on ? "#000000" : "#ffffff";
+    roundedCapsulePath(x+2, y+2, w-4, h*0.48);
+    ctx.fill();
+
+    ctx.globalAlpha = 1;
+
+    // outline
+    ctx.strokeStyle = on ? "rgba(0,0,0,.45)" : "rgba(255,255,255,.22)";
+    ctx.lineWidth = 2;
+    roundedCapsulePath(x, y, w, h);
+    ctx.stroke();
+
+    // knob
+    const pad = Math.max(3, Math.round(h*0.12));
+    const r = (h - pad*2)/2;
+    const cx = on ? (x + w - pad - r) : (x + pad + r);
+    const cy = y + h/2;
+
+    // knob shadow
+    ctx.fillStyle = "rgba(0,0,0,.35)";
+    ctx.beginPath();
+    ctx.arc(cx+1.5, cy+2.0, r*1.03, 0, Math.PI*2);
+    ctx.fill();
+
+    // knob body
+    ctx.fillStyle = knobFill;
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, 0, Math.PI*2);
+    ctx.fill();
+
+    // knob highlight
+    ctx.globalAlpha = 0.20;
+    ctx.fillStyle = on ? "#ffffff" : "#000000";
+    ctx.beginPath();
+    ctx.arc(cx - r*0.25, cy - r*0.25, r*0.55, 0, Math.PI*2);
+    ctx.fill();
+
+    ctx.restore();
+  }
+
+  /* ----------------------------- Game ----------------------------- */
+  const STATE = { MENU:1, PLAY:2, OVER:3 };
+
+  class Santa {
+    constructor(images){ this.imgs=images; this.reset(); }
+    reset(){ this.x=0; this.y=0; this.vy=0; this.size=64; this.animT=999; this.pitch=0; }
+    setSize(px){ this.size=px; }
+    radius(){ return this.size*0.30; }
+    flap(){ this.animT=0; }
+    update(dt, gravity, maxFall){
+      this.vy += gravity*dt;
+      this.vy = clamp(this.vy, -9999, maxFall);
+      this.y  += this.vy*dt;
+      this.animT += dt;
+      const targetPitch = clamp(this.vy/650, -0.40, 1.05);
+      this.pitch = lerp(this.pitch, targetPitch, 1 - Math.pow(0.001, dt));
+    }
+    frame(){
+      if (this.animT < 0.08) return this.imgs.santaFlap1 || this.imgs.santaIdle;
+      if (this.animT < 0.16) return this.imgs.santaFlap2 || this.imgs.santaIdle;
+      if (this.animT < 0.24) return this.imgs.santaFlap1 || this.imgs.santaIdle;
+      return this.imgs.santaIdle;
+    }
+    draw(){
+      const img=this.frame();
+      const s=this.size;
+      ctx.save();
+      ctx.translate(this.x, this.y);
+      ctx.rotate(this.pitch);
+      if (img){
+        const aspect = img.width / img.height;
+        const w = s * 1.55;
+        const h = w / aspect;
+        ctx.drawImage(img, -w/2, -h/2, w, h);
+      } else {
+        ctx.fillStyle="red"; ctx.beginPath(); ctx.arc(0,0,this.radius(),0,Math.PI*2); ctx.fill();
+      }
+      ctx.restore();
+    }
+  }
+
+  class PipePair {
+    constructor(x, gapY, gapH, w){
+      this.x=x; this.gapY=gapY; this.gapH=gapH; this.w=w;
+      this.scored=false;
+      this.giftDropped=false;
+    }
+  }
+
+  class Gift {
+    constructor(x, y, size){
+      this.x=x; this.y=y;
+      this.vy=0;
+      this.size=size;
+      this.alive=true;
+    }
+    update(dt, speed, gravity){
+      // мир скроллится влево
+      this.x -= speed*dt;
+      // падает вниз
+      this.vy += gravity*dt;
+      this.y  += this.vy*dt;
+
+      if (this.y > H + 220) this.alive=false;
+      if (this.x < -240) this.alive=false;
+    }
+    draw(img){
+      const s=this.size;
+      if (img) ctx.drawImage(img, this.x - s/2, this.y - s/2, s, s);
+      else { ctx.fillStyle="gold"; ctx.fillRect(this.x-s/2, this.y-s/2, s, s); }
+    }
+  }
+
+  class Game {
+    constructor(images){
+      this.imgs=images;
+      this.state=STATE.MENU;
+      this.stateT=0;
+
+      this.fixedDt=1/120;
+      this.acc=0;
+      this.last=performance.now();
+
+      this.score=0;
+      this.best=parseInt(safeStorageGet("dmflappy.best","0"),10)||0;
+
+      this.baseSpeed=165;
+      this.speed=this.baseSpeed;
+      this.speedTarget=this.baseSpeed;
+
+      this.gravity=1700;
+      this.flapImpulse=-505;
+      this.maxFall=860;
+
+      this.pipeW=86;
+      this.spawnDist=290;
+      this.distSinceSpawn=0;
+
+      this.gapMax=190;
+      this.gapMin=135;
+
+      this.groundY=0;
+      this.overlay={ x:0,y:0,width:0,height:0,scale:1 };
+
+      this.santa=new Santa(images);
+      this.pipes=[];
+      this.gifts=[];
+
+      this.rewardSent=false;
+
+      // UI hitboxes
+      this.sfxHit = { x:0,y:0,w:0,h:0 };
+      this.restartBtn = { x:0,y:0,w:0,h:0, hover:false };
+
+      // pointer state (для hover рестарта)
+      this.pointer = { x:-9999, y:-9999 };
+
+      // input buffer
+      this.inputBuffered=false;
+      this.inputAge=999;
+
+      this._applyLayout();
+      this._bindInput();
+      this._buildMenuPipes();
+    }
+
+    _applyLayout(){
+      const groundH = Math.round(H*0.14);
+      this.groundY = H - groundH;
+
+      this.santa.setSize(Math.round(Math.min(W,H)*0.10));
+      this.santa.x = Math.round(W*0.30);
+      this.santa.y = Math.round(H*0.46);
+
+      this.pipeW = Math.round(Math.min(96, Math.max(76, W*0.19)));
+      this.spawnDist = Math.round(W*0.64);
+    }
+
+    _buildMenuPipes(){
+      const gapH=240;
+      const leftX=Math.round(W*0.32);
+      const rightX=Math.round(W*0.70);
+      const gapY1=Math.round(this.groundY*0.40);
+      const gapY2=Math.round(this.groundY*0.22);
+      this.menuPipes=[
+        new PipePair(leftX - this.pipeW/2, gapY1, gapH, this.pipeW),
+        new PipePair(rightX - this.pipeW/2, gapY2, gapH, this.pipeW),
+      ];
+    }
+
+    _difficulty(){
+      const t=this.stateT;
+      const s=this.score;
+      const speedBoost = clamp(s*3.3 + t*2.0, 0, 105);
+      const gapTighten = clamp(s*1.4, 0, 38);
+      const gapBase = this.gapMax - gapTighten;
+      const gap = clamp(gapBase, this.gapMin, this.gapMax);
+      return { gap, speed: this.baseSpeed + speedBoost };
+    }
+
+    _spawnPipe(x){
+      const { gap } = this._difficulty();
+      const marginTop=56;
+      const marginBottom=74;
+      const safeTop = marginTop + gap*0.5;
+      const safeBottom = this.groundY - marginBottom - gap*0.5;
+      const center = safeTop + Math.random()*(safeBottom-safeTop);
+      const gapY = center - gap*0.5;
+      this.pipes.push(new PipePair(x, gapY, gap, this.pipeW));
+    }
+
+    start(){
+      this.score=0;
+      this.speed=this.baseSpeed;
+      this.speedTarget=this.baseSpeed;
+      this.distSinceSpawn=0;
+      this.pipes.length=0;
+      this.gifts.length=0;
+      this.rewardSent=false;
+
+      this.santa.reset();
+      this.santa.setSize(Math.round(Math.min(W,H)*0.10));
+      this.santa.x = Math.round(W*0.30);
+      this.santa.y = Math.round(H*0.46);
+
+      this._spawnPipe(W + 140);
+      this.state=STATE.PLAY;
+      this.stateT=0;
+    }
+
+    restart(){ this.start(); }
+
+    _toggleSfx(){
+      audio.ensure();
+      audio.setMuted(!audio.muted);
+    }
+
+    _hitRect(x,y,r){ return x>=r.x && x<=r.x+r.w && y>=r.y && y<=r.y+r.h; }
+
+    _bindInput(){
+      canvas.addEventListener("pointermove", (e) => {
+        const r = canvas.getBoundingClientRect();
+        this.pointer.x = (e.clientX - r.left);
+        this.pointer.y = (e.clientY - r.top);
+      }, { passive:true });
+
+      canvas.addEventListener("pointerdown", (e) => {
+        e.preventDefault();
+        audio.ensure();
+
+        const r = canvas.getBoundingClientRect();
+        const mx = (e.clientX - r.left);
+        const my = (e.clientY - r.top);
+
+        // SFX toggle всегда кликабелен
+        if (this._hitRect(mx,my,this.sfxHit)){
+          this._toggleSfx();
+          return;
+        }
+
+        // GAME OVER: рестарт ТОЛЬКО по кнопке
+        if (this.state === STATE.OVER){
+          if (this._hitRect(mx,my,this.restartBtn)){
+            this.restart();
+          }
+          return;
+        }
+
+        // MENU/PLAY: обычное действие
+        this.inputBuffered=true;
+        this.inputAge=0;
+
+        if (this.state === STATE.MENU) this.start();
+      }, { passive:false });
+
+      window.addEventListener("keydown", (e) => {
+        if (e.code === "Space" || e.code === "ArrowUp" || e.code === "KeyW"){
+          e.preventDefault();
+          audio.ensure();
+          if (this.state === STATE.OVER){
+            // space тоже рестартит
+            this.restart();
+            return;
+          }
+          this.inputBuffered=true;
+          this.inputAge=0;
+          if (this.state === STATE.MENU) this.start();
+        }
+        if (this.state === STATE.OVER && (e.code === "Enter")){
+          e.preventDefault();
+          this.restart();
+        }
+      }, { passive:false });
+    }
+
+    _circleRectHit(cx, cy, r, rx, ry, rw, rh){
+      const nx = clamp(cx, rx, rx+rw);
+      const ny = clamp(cy, ry, ry+rh);
+      const dx = cx - nx, dy = cy - ny;
+      return (dx*dx + dy*dy) <= r*r;
+    }
+
+    update(dt){
+      this.stateT += dt;
+      this.inputAge += dt;
+
+      if (this.state === STATE.MENU){
+        const bob = Math.sin(this.stateT*2.2)*6;
+        this.santa.y = lerp(this.santa.y, H*0.46 + bob, 1 - Math.pow(0.001, dt));
+        this.santa.vy = 0;
+        this.santa.pitch = lerp(this.santa.pitch, -0.06, 1 - Math.pow(0.001, dt));
+        return;
+      }
+
+      if (this.state === STATE.OVER){
+        this.santa.update(dt, this.gravity, this.maxFall);
+        // hover рестарта обновим в рендере (там есть координаты кнопки)
+        return;
+      }
+
+      const d = this._difficulty();
+      this.speedTarget = d.speed;
+      this.speed = lerp(this.speed, this.speedTarget, 1 - Math.pow(0.001, dt));
+
+      this.acc += dt;
+      this.acc = Math.min(this.acc, 0.12);
+
+      while (this.acc >= this.fixedDt){
+        this._step(this.fixedDt);
+        this.acc -= this.fixedDt;
+      }
+    }
+
+    _step(dt){
+      if (this.inputBuffered && this.inputAge <= 0.13){
+        this.inputBuffered=false;
+        this.inputAge=999;
+        this.santa.vy = this.flapImpulse;
+        this.santa.flap();
+        audio.flap();
+      }
+
+      this.distSinceSpawn += this.speed*dt;
+      if (this.distSinceSpawn >= this.spawnDist){
+        this.distSinceSpawn -= this.spawnDist;
+        this._spawnPipe(W + 70);
+      }
+
+      for (const p of this.pipes) p.x -= this.speed*dt;
+      while (this.pipes.length && this.pipes[0].x + this.pipes[0].w < -140) this.pipes.shift();
+
+      for (const g of this.gifts) g.update(dt, this.speed, 1250);
+      this.gifts = this.gifts.filter(g => g.alive);
+
+      this.santa.update(dt, this.gravity, this.maxFall);
+
+      this._collideScoreGift();
+    }
+
+    _collideScoreGift(){
+      const r = this.santa.radius();
+
+      if (this.santa.y + r > this.groundY){
+        this._die();
+        return;
+      }
+
+      for (const p of this.pipes){
+        const topH = p.gapY;
+        const botY = p.gapY + p.gapH;
+        const botH = this.groundY - botY;
+
+        const pipeMid = p.x + p.w*0.5;
+        if (!p.scored && this.santa.x > pipeMid){
+          p.scored = true;
+          this.score++;
+          if (this.score > this.best){
+            this.best = this.score;
+            safeStorageSet("dmflappy.best", String(this.best));
+          }
+          audio.score();
+
+          if (!this.rewardSent && this.score >= REWARD_SCORE){
+            this.rewardSent = true;
+            sendGiftReward("score-threshold");
+          }
+
+          // подарок падает “в трубу”
+          if (!p.giftDropped){
+            p.giftDropped = true;
+            const giftSize = Math.max(22, Math.round(p.w*0.52));
+            this.gifts.push(new Gift(pipeMid, this.santa.y, giftSize));
+          }
+        }
+
+        // collision rects (мягче по ширине)
+        const pad = Math.max(8, p.w*0.10);
+        const rx = p.x + pad;
+        const rw = p.w - pad*2;
+
+        const hitTop = this._circleRectHit(this.santa.x, this.santa.y, r, rx, -80, rw, topH + 80);
+        const hitBot = this._circleRectHit(this.santa.x, this.santa.y, r, rx, botY, rw, botH + 80);
+
+        if (hitTop || hitBot){
+          this._die();
+          return;
+        }
+      }
+    }
+
+    _die(){
+      if (this.state !== STATE.PLAY) return;
+      audio.hit();
+      this.state = STATE.OVER;
+      this.stateT = 0;
+    }
+
+    render(){
+      ctx.clearRect(0,0,W,H);
+
+      // фон (JPG)
+      if (this.imgs.bg) drawCover(this.imgs.bg, 0,0,W,H);
+
+      // препятствия (задний слой)
+      if (this.state === STATE.MENU) this._drawObstaclesBack(this.menuPipes);
+      else this._drawObstaclesBack(this.pipes);
+
+      // подарки между слоями трубы
+      for (const g of this.gifts) g.draw(this.imgs.gift);
+
+      // передний слой трубы
+      if (this.state === STATE.MENU) this._drawObstaclesFront(this.menuPipes);
+      else this._drawObstaclesFront(this.pipes);
+
+      // дед мороз
+      this.santa.draw();
+
+      // верхний HUD
+      this._drawHUD();
+
+      // нижняя подложка
+      this.overlay = drawBottomOverlayExtended(this.imgs.groundOverlay, W, H);
+
+      // bottom UI: SFX toggle + подсказка
+      this._drawBottomUI();
+
+      // overlays
+      if (this.state === STATE.MENU) this._drawMenuText();
+      if (this.state === STATE.OVER) this._drawGameOver();
+    }
+
+    _drawObstaclesBack(pipes){
+      const topImg = this.imgs.topObstacle;
+      const back = this.imgs.pipeBack;
+
+      for (const p of pipes){
+        const topH = p.gapY;
+        const botY = p.gapY + p.gapH;
+        const botH = this.groundY - botY;
+
+        // верх (сосульки)
+        const topExtra = 90;
+        const ty = -topExtra;
+        const th = topH + topExtra;
+        if (topImg) ctx.drawImage(topImg, p.x, ty, p.w, th);
+
+        // низ (труба зад)
+        const botExtra = 120;
+        const by = botY;
+        const bh = botH + botExtra;
+        if (back) ctx.drawImage(back, p.x, by, p.w, bh);
+      }
+    }
+
+    _drawObstaclesFront(pipes){
+      const front = this.imgs.pipeFront;
+      if (!front) return;
+
+      for (const p of pipes){
+        const botY = p.gapY + p.gapH;
+        const botH = this.groundY - botY;
+
+        const botExtra = 120;
+        const by = botY;
+        const bh = botH + botExtra;
+
+        // труба перед (накрывает подарок)
+        ctx.drawImage(front, p.x, by, p.w, bh);
+      }
+    }
+
+    _drawHUD(){
+      const scoreSize = Math.round(W*0.17);
+      textStrokeFill(String(this.score), W*0.5, 14, scoreSize, "center", 1);
+
+      ctx.save();
+      ctx.font = `900 ${Math.round(W*0.055)}px ui-sans-serif, system-ui`;
+      ctx.textAlign="center"; ctx.textBaseline="top"; ctx.lineJoin="round";
+      ctx.lineWidth = 6;
+      ctx.strokeStyle = "rgba(0,0,0,.45)";
+      ctx.fillStyle = "rgba(255,255,255,.75)";
+      const y = 14 + scoreSize;
+      ctx.strokeText(`BEST ${this.best}`, W*0.5, y);
+      ctx.fillText(`BEST ${this.best}`, W*0.5, y);
+      ctx.restore();
+    }
+
+    _drawMenuText(){
+      // (если нужно убрать центральный текст в меню — скажи)
+      const y = H*0.40;
+      textStrokeFill("TAP\nTO FLAP", W*0.5, y, Math.round(W*0.11), "center", 0.95);
+
+      ctx.save();
+      ctx.font = `800 ${Math.round(W*0.045)}px ui-sans-serif, system-ui`;
+      ctx.textAlign="center"; ctx.textBaseline="top";
+      ctx.fillStyle = "rgba(255,255,255,.85)";
+      ctx.fillText("Click / Space тоже работает", W*0.5, y + Math.round(W*0.26));
+      ctx.restore();
+    }
+
+    _drawBottomUI(){
+  const oh = this.overlay.height || 140;
+
+  // базовые отступы снизу (как было, но теперь всё считаем от одного центра)
+  const bottomPad = Math.round(oh * 0.10);
+
+  // размеры текста подсказки
+  const big = Math.round(W * 0.075);
+  const lineGap = Math.round(big * 0.95);
+  const hintH = big + lineGap;
+
+  // размеры SFX toggle
+  const toggleW = Math.round(W * 0.12);
+  const toggleH = Math.round(toggleW * 0.52);
+
+  // общий "центр" нижнего UI (и SFX, и 2 строки подсказки)
+  // тут можно подвинуть выше/ниже одним числом (0.20 -> 0.18 например)
+  const uiCenterY = Math.round(H - bottomPad - oh * 0.20);
+
+  // --- SFX слева (центрирован между 2 строками) ---
+  const left = Math.round(W * 0.055);
+
+  const labelSize = Math.round(W * 0.060);
+  ctx.save();
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+  ctx.font = `900 ${labelSize}px ui-sans-serif, system-ui`;
+  ctx.lineJoin = "round";
+  ctx.lineWidth = 6;
+  ctx.strokeStyle = "rgba(0,0,0,.55)";
+  ctx.fillStyle = "rgba(255,255,255,.98)";
+  ctx.strokeText("SFX", left, uiCenterY);
+  ctx.fillText("SFX",  left, uiCenterY);
+  ctx.restore();
+
+  const tx = Math.round(left + W * 0.13);
+  const ty = Math.round(uiCenterY - toggleH/2);
+
+  drawSfxToggle(tx, ty, toggleW, toggleH, !audio.muted);
+
+  this.sfxHit.x = tx - 10;
+  this.sfxHit.y = ty - 10;
+  this.sfxHit.w = toggleW + 20;
+  this.sfxHit.h = toggleH + 20;
+
+  // --- Подсказка справа (2 строки) ---
+  const textX = Math.round(W * 0.62);
+  const textTop = Math.round(uiCenterY - hintH / 2);
+
+  textStrokeFill("TAP / CLICK /", textX, textTop, big, "center", 1);
+  textStrokeFill("SPACE - FLAP",  textX, textTop + lineGap, big, "center", 1);
+}
+
+  _drawGameOver(){
+  const win = this.imgs.gameOverWindow;
+
+  // окно выше
+  let dx=0, dy=0, dw=0, dh=0;
+
+  if (win){
+    const maxW = W * 0.86;
+    const maxH = H * 0.62;
+    const s = Math.min(maxW / win.width, maxH / win.height);
+    dw = win.width * s;
+    dh = win.height * s;
+    dx = (W - dw) / 2;
+    dy = H * 0.12;
+    ctx.drawImage(win, dx, dy, dw, dh);
+  } else {
+    dw = W * 0.82; dh = H * 0.40;
+    dx = (W - dw)/2; dy = H * 0.14;
+    ctx.save();
+    ctx.fillStyle="rgba(0,0,0,.35)";
+    ctx.fillRect(dx,dy,dw,dh);
+    ctx.restore();
+  }
+
+  // ---------- RESTART button (на 35% меньше + ВЫШЕ) ----------
+  // размеры считаем по обычной (не hover) картинке, чтобы не прыгало
+  const baseForSize = this.imgs.restart || this.imgs.restartHover;
+  const btnMaxW = dw * 0.62;
+  const btnMaxH = dh * 0.22;
+
+  let bw = btnMaxW, bh = btnMaxH;
+  if (baseForSize){
+    const s = Math.min(btnMaxW / baseForSize.width, btnMaxH / baseForSize.height);
+    bw = baseForSize.width * s;
+    bh = baseForSize.height * s;
+  }
+
+  // -35%
+  bw *= 0.65;
+  bh *= 0.65;
+
+  const bx = dx + (dw - bw) / 2;
+
+  // было 0.10 — делаем больше отступ снизу => кнопка ВЫШЕ
+  const by = Math.round(dy + dh - bh - dh * 0.14);
+
+  // hover check
+  this.restartBtn.x = bx;
+  this.restartBtn.y = by;
+  this.restartBtn.w = bw;
+  this.restartBtn.h = bh;
+  this.restartBtn.hover =
+    (this.pointer.x >= bx && this.pointer.x <= bx + bw &&
+     this.pointer.y >= by && this.pointer.y <= by + bh);
+
+  const btnImg = (this.restartBtn.hover ? this.imgs.restartHover : this.imgs.restart) || this.imgs.restart || this.imgs.restartHover;
+
+  if (btnImg){
+    ctx.drawImage(btnImg, bx, by, bw, bh);
+  } else {
+    ctx.save();
+    ctx.fillStyle="rgba(255,255,255,.25)";
+    ctx.fillRect(bx,by,bw,bh);
+    textStrokeFill("RESTART", bx + bw/2, by + bh*0.22, Math.round(bh*0.55), "center", 1);
+    ctx.restore();
+  }
+
+  // ---------- TEXT (GAME OVER / SCORE / BEST) ----------
+  // GAME OVER меньше на 40%
+  const titleSize = Math.round(dw * 0.14 * 0.60);
+  const subSize   = Math.round(dw * 0.075 * 0.92);
+
+  // БОЛЬШЕ расстояние между GAME OVER и SCORE
+  const gapTitleToSub = Math.round(titleSize * 1.55);
+  const gapSubToSub   = Math.round(subSize * 1.00);
+
+  const cx = dx + dw * 0.5;
+
+  // Ставим текстовый блок так, чтобы он был ЧУТЬ ВЫШЕ кнопки
+  const blockH = titleSize + gapTitleToSub + subSize + gapSubToSub + subSize;
+  const aboveBtnGap = -28;
+  
+  let titleY = Math.round(by - aboveBtnGap - blockH);
+
+  // чтобы не улетело слишком высоко/низко (страховка)
+  const minY = Math.round(dy + dh * 0.16);
+  const maxY = Math.round(dy + dh * 0.55);
+  titleY = clamp(titleY, minY, maxY);
+
+  textStrokeFill("GAME OVER", cx, titleY, titleSize, "center", 1);
+  textStrokeFill(`SCORE ${this.score}`, cx, titleY + gapTitleToSub, subSize, "center", 1);
+  textStrokeFill(`BEST ${this.best}`,   cx, titleY + gapTitleToSub + gapSubToSub, subSize, "center", 1);
+}
+
+  }
+
+  /* ----------------------------- Boot ----------------------------- */
+  let game=null;
+
+  function onResize(){
+    resizeCanvas();
+    if (game){
+      game._applyLayout();
+      game._buildMenuPipes();
+    }
+  }
+  window.addEventListener("resize", onResize, { passive:true });
+
+  function loop(now){
+    if (!game){ requestAnimationFrame(loop); return; }
+    const dt = Math.min(0.033, (now - game.last)/1000);
+    game.last = now;
+    game.update(dt);
+    game.render();
+    requestAnimationFrame(loop);
+  }
+
+  (async () => {
+    const images = await loadAllAssets();
+    loadingEl.style.display = "none";
+    game = new Game(images);
+    requestAnimationFrame((t)=>{ game.last=t; requestAnimationFrame(loop); });
+  })();
+
+})();
+</script>
+</body>
+</html>
