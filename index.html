@@ -61,6 +61,37 @@
     try { localStorage.setItem(key, value); } catch {}
   }
 
+  /* ----------------------------- Canvas + scale ----------------------------- */
+  const stage = document.getElementById("stage");
+  const canvas = document.getElementById("game");
+  const ctx = canvas.getContext("2d", { alpha:true, desynchronized:true });
+  const loadingEl = document.getElementById("loading");
+
+  // Fullscreen on mobile
+  const ua = navigator.userAgent || "";
+  const isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(ua);
+  let fullscreenEntered = false;
+
+  async function requestFullscreenIfMobile(reason = "gesture"){
+    if (fullscreenEntered || !isMobile) return;
+    const el = stage || document.documentElement;
+    const fn =
+      el.requestFullscreen ||
+      el.webkitRequestFullscreen ||
+      el.msRequestFullscreen ||
+      el.mozRequestFullScreen;
+    if (!fn) return;
+    try {
+      const p = fn.call(el);
+      fullscreenEntered = true;
+      await (p?.catch ? p : Promise.resolve());
+      console.log("Fullscreen entered:", reason);
+    } catch (err) {
+      fullscreenEntered = false;
+      console.warn("Fullscreen request failed", err);
+    }
+  }
+
   /* ----------------------------- Telegram WebApp ----------------------------- */
   const REWARD_ACTION = "frost_flight_reward";
   const REWARD_SCORE = 12; // награда после 12 очков
@@ -78,6 +109,7 @@
       tg.ready();
       tg.expand?.();
       tg.requestFullscreen?.();
+      requestFullscreenIfMobile("tg-init");
     } catch (err) {
       console.warn("Telegram WebApp init failed", err);
     }
@@ -95,12 +127,6 @@
       return { sent:false, reason:"error" };
     }
   }
-
-  /* ----------------------------- Canvas + scale ----------------------------- */
-  const stage = document.getElementById("stage");
-  const canvas = document.getElementById("game");
-  const ctx = canvas.getContext("2d", { alpha:true, desynchronized:true });
-  const loadingEl = document.getElementById("loading");
 
   let DPR=1, W=0, H=0;
 
@@ -531,6 +557,7 @@
       canvas.addEventListener("pointerdown", (e) => {
         e.preventDefault();
         audio.ensure();
+        requestFullscreenIfMobile("pointerdown");
 
         const r = canvas.getBoundingClientRect();
         const mx = (e.clientX - r.left);
